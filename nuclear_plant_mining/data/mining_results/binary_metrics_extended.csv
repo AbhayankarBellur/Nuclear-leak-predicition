@@ -1,0 +1,6 @@
+Algorithm,Accuracy,ROC_AUC,Average_Precision,Precision@0.5,Recall@0.5,F1@0.5
+Decision Tree,1.0,1.0,1.0,1.0,1.0,1.0
+Random Forest,1.0,1.0,1.0,1.0,1.0,1.0
+Logistic Regression,1.0,1.0,1.0,1.0,1.0,1.0
+SVM,1.0,1.0,1.0,1.0,1.0,1.0
+KNN,1.0,1.0,1.0,1.0,1.0,1.0

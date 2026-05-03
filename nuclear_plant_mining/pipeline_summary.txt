@@ -1,0 +1,387 @@
+PROJECT: Nuclear Plant Data Mining Pipeline – End-to-End Summary
+
+This document summarizes the full workflow from synthetic data generation to preprocessing, modeling, mining tasks, and visualization. Each section includes brief rationale and representative code snippets for inclusion in a pitch deck.
+
+---
+SECTION 1 — Synthetic Data Generation
+Goal: Create realistic minute-level sensor data with injected leak events, false positives, missingness, outages, and drift.
+
+Key techniques:
+- Minute cadence over 14 days with diurnal patterns
+- Multiple correlated process sensors and derived signals
+- Leak events (gradual/rapid) injected with multi-sensor signatures
+- False-positive spikes (radiation/humidity)
+- MCAR missingness, contiguous outages, and sensor drift
+
+Code snippet (core ideas):
+```python
+# Time index and baselines
+ts = pd.date_range(start=START, periods=DAYS*24*60, freq="1min")
+
+def baseline(mean, sd, daily_amp=0.0):
+    t = np.arange(len(ts))
+    arr = np.random.normal(loc=mean, scale=sd, size=len(ts))
+    if daily_amp:
+        arr += daily_amp * np.sin(2*np.pi*t/(24*60))
+    return arr
+
+# Example sensors
+df = pd.DataFrame({
+    "timestamp": ts,
+    "sump_flow_lpm": np.random.exponential(scale=0.02, size=len(ts)),
+    "airborne_gamma_uSvph": baseline(0.12, 0.02, daily_amp=0.02),
+    "makeup_flow_lpm": baseline(150.0, 2.5),
+    "letdown_flow_lpm": baseline(148.0, 3.0),
+    # ... other sensors ...
+})
+
+# Derived features
+df["rcs_mass_balance_lpm"] = df["makeup_flow_lpm"] - df["letdown_flow_lpm"]
+df["temp_gradient_C"] = df["rcs_hot_leg_temp_C"] - df["rcs_cold_leg_temp_C"]
+
+# Inject leak events (gradual/rapid) impacting multiple sensors
+for s, e, leak_size in leak_windows:
+    ramp = np.linspace(0, leak_size, e - s + 1)
+    df.loc[s:e, "sump_flow_lpm"] += ramp
+    df.loc[s:e, "airborne_gamma_uSvph"] += np.sqrt(leak_size) * np.linspace(0.2, 1.2, e - s + 1)
+    df.loc[s:e, "makeup_flow_lpm"] += ramp
+    # ... additional correlated changes ...
+
+# Flags and leak rates
+df["ground_truth_leak_flag"] = False
+# ... mark intervals True and set ground_truth_leak_rate_lpm ...
+
+# Missingness, outages, drift
+mask = np.random.rand(len(df)) < 0.02
+df.loc[mask, "sump_flow_lpm"] = np.nan
+# contiguous outages and a bias shift in pump vibration
+```
+
+---
+SECTION 2 — Preprocessing & Data Quality
+Goal: Repair short/medium gaps, flag long outages, detect/cap non-event outliers, denoise, and correct drift while preserving true events.
+
+Key techniques:
+- Range checks and missingness profiling
+- Gap categorization: short (ffill/bfill), medium (time interpolation), long (flag only)
+- Outlier detection: IQR + rolling-MAD; policy to preserve event-period anomalies
+- Denoising: rolling median and Savitzky–Golay
+- Drift detection: median-shift heuristic with correction
+
+Code snippet (gap handling and flags):
+```python
+# Short gaps: forward/backward fill with limits
+for col in sensors:
+    df_shortfilled[col] = df[col].ffill(limit=5).bfill(limit=5)
+
+# Medium gaps: time-based interpolation
+for col in sensors:
+    df_interp[col] = df_shortfilled[col].interpolate(method="time", limit=30)
+
+# Long gaps: flag, do not impute blindly
+def contiguous_nan_segments(series):
+    is_na = series.isna().astype(int)
+    groups = (is_na != is_na.shift()).cumsum()
+    for _, sub in series.groupby(groups):
+        if sub.isna().all():
+            yield sub.index[0], sub.index[-1], len(sub)
+
+flags = pd.DataFrame(index=df.index)
+for col in sensors:
+    mask = pd.Series(False, index=df.index)
+    for s, e, L in contiguous_nan_segments(df[col]):
+        if L >= 31:
+            mask.loc[s:e] = True
+    flags[col + "_outage"] = mask
+```
+
+Code snippet (outlier policy and denoising):
+```python
+# IQR thresholds
+q1, q3 = s.quantile(0.25), s.quantile(0.75)
+iqr = q3 - q1
+lower, upper = q1 - 1.5*iqr, q3 + 1.5*iqr
+
+# Preserve event anomalies; cap only non-event outliers
+event_mask = df_interp["ground_truth_leak_flag"].fillna(False)
+non_event = ~event_mask
+cap_mask = non_event & ((df_interp[col] < lower) | (df_interp[col] > upper))
+df_cleaned[col] = df_interp[col]
+df_cleaned.loc[cap_mask, col] = df_cleaned.loc[cap_mask, col].clip(lower, upper)
+
+# Denoising
+df_cleaned[col + "_rolling_median"] = df_cleaned[col].rolling(5, center=True, min_periods=1).median()
+df_cleaned[col + "_savgol"] = savgol_filter(
+    df_cleaned[col].ffill().bfill().values, window_length=11, polyorder=2, mode='interp'
+)
+```
+
+Code snippet (drift correction):
+```python
+def detect_and_correct_drift(series):
+    mid = len(series)//2
+    first_med, second_med = series.iloc[:mid].median(), series.iloc[mid:].median()
+    shift = second_med - first_med
+    if abs(shift) > 3 * series.std():
+        corrected = series.copy()
+        corrected.iloc[mid:] = corrected.iloc[mid:] - shift
+        return corrected, shift
+    return series, 0.0
+
+pv_corr, pv_shift = detect_and_correct_drift(df_cleaned["pump_vibration_mm_s"].ffill().bfill())
+```
+
+---
+SECTION 3 — Feature Engineering & Transformations
+Goal: Create interpretable indices, rolling statistics, slopes, power transforms, scaling, and PCA components for downstream modeling.
+
+Key techniques:
+- Rolling mean/std windows: 5, 15, 60 minutes
+- Slopes/deltas for key thermohydraulic signals
+- Composite indices: radiation, hydraulic imbalance, thermal stress
+- Yeo–Johnson transform + standardization for skewed sensors
+- PCA retaining 95% variance; store components as pc_01 … pc_K
+
+Code snippet (rolling stats, slopes):
+```python
+for w in [5, 15, 60]:
+    for col in ["sump_flow_lpm", "airborne_gamma_uSvph", "rcs_mass_balance_lpm", "pressurizer_level_pct"]:
+        df_cleaned[f"{col}_rollmean_{w}m"] = df_cleaned[col].rolling(w, min_periods=1).mean()
+        df_cleaned[f"{col}_rollstd_{w}m"] = df_cleaned[col].rolling(w, min_periods=1).std().fillna(0)
+
+for col in ["pressurizer_level_pct", "rcs_hot_leg_temp_C", "rcs_cold_leg_temp_C"]:
+    df_cleaned[f"{col}_delta_1m"] = df_cleaned[col].diff().fillna(0)
+    df_cleaned[f"{col}_slope_5m"] = df_cleaned[f"{col}_delta_1m"].rolling(5, min_periods=1).mean()
+```
+
+Code snippet (indices, transforms, PCA):
+```python
+# Composite indices
+rad_cols = ["airborne_gamma_uSvph", "particulate_cpm"]
+rad_std = (df_cleaned[rad_cols] - df_cleaned[rad_cols].median()) / df_cleaned[rad_cols].std().replace(0, 1)
+df_cleaned["radiation_index"] = 0.6*rad_std[rad_cols[0]] + 0.4*rad_std[rad_cols[1]]
+
+df_cleaned["hydraulic_imbalance_index"] = (
+    (df_cleaned["makeup_flow_lpm"] - df_cleaned["letdown_flow_lpm"]) /
+    (df_cleaned["makeup_flow_lpm"] + df_cleaned["letdown_flow_lpm"] + 1e-6)
+)
+
+df_cleaned["thermal_stress_index"] = df_cleaned["temp_gradient_C"] * (
+    df_cleaned["primary_flow_kgps"].mean() / (df_cleaned["primary_flow_kgps"] + 1e-6)
+)
+
+# Yeo–Johnson + Standardization
+transform_cols = ["airborne_gamma_uSvph", "particulate_cpm", "sump_flow_lpm", "rcs_mass_balance_lpm"]
+pt = PowerTransformer(method="yeo-johnson", standardize=False)
+Xt_pt = pt.fit_transform(df_cleaned[transform_cols].ffill().fillna(0).values)
+scaler = StandardScaler(); Xt_scaled = scaler.fit_transform(Xt_pt)
+
+# PCA (95% variance) and component columns
+scaler_pca = StandardScaler(); X_scaled = scaler_pca.fit_transform(df_cleaned[features_for_pca].fillna(0))
+pca = PCA(n_components=0.95, svd_solver="full")
+X_pca = pca.fit_transform(X_scaled)
+for i in range(X_pca.shape[1]):
+    df_cleaned[f"pc_{i+1:02d}"] = X_pca[:, i]
+```
+
+---
+SECTION 4 — Mining Tasks (Modeling)
+Goal: Predict risk levels and leak rates; compare algorithms; extract feature importance; evaluate with metrics and plots.
+
+Classification:
+- Inputs: selected interpretable features + top PCA components
+- Targets: multi-class risk_level and binary leak/no-leak
+- Models: Decision Tree, Random Forest, Logistic Regression, SVM, KNN
+- Metrics: Accuracy, CV scores; AUC for binary
+
+Code snippet (classification loop):
+```python
+X_class = df[mining_features].fillna(df[mining_features].median())
+y_class = df["risk_level"]
+y_binary = (df["ground_truth_leak_flag"] == True).astype(int)
+
+X_tr, X_te, y_tr, y_te = train_test_split(X_class, y_class, test_size=0.2, stratify=y_class, random_state=42)
+
+classifiers = {
+    'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
+    'SVM': SVC(probability=True, random_state=42),
+    'KNN': KNeighborsClassifier(n_neighbors=5)
+}
+
+for name, clf in classifiers.items():
+    clf.fit(X_tr, y_tr)
+    acc = clf.score(X_te, y_te)
+    cv = cross_val_score(clf, X_tr, y_tr, cv=5)
+    # store/print metrics and plots
+```
+
+Regression (leak rate):
+- Subset to leak-event rows; predict ground_truth_leak_rate_lpm
+- Models: Linear/Ridge, Random Forest, SVR, KNN
+- Metrics: MSE, RMSE, R²; scatter vs identity line
+
+Code snippet (regression loop):
+```python
+leak_data = df[df['ground_truth_leak_flag'] == True]
+X_reg = leak_data[mining_features].fillna(leak_data[mining_features].median())
+y_reg = leak_data['ground_truth_leak_rate_lpm']
+
+X_tr, X_te, y_tr, y_te = train_test_split(X_reg, y_reg, test_size=0.2, random_state=42)
+regressors = {
+    'Linear Regression': LinearRegression(),
+    'Ridge Regression': Ridge(alpha=1.0),
+    'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
+    'SVR': SVR(kernel='rbf'),
+    'KNN': KNeighborsRegressor(n_neighbors=5)
+}
+for name, reg in regressors.items():
+    reg.fit(X_tr, y_tr)
+    y_pred = reg.predict(X_te)
+    mse = mean_squared_error(y_te, y_pred)
+    r2 = r2_score(y_te, y_pred)
+```
+
+Association Rules:
+- Discretize key numerics, one-hot encode, mine frequent itemsets and rules
+- Filter for rules involving leak/high-risk
+
+Code snippet (rules):
+```python
+for col in numeric_cols:
+    df_assoc[f"{col}_bin"] = pd.cut(df_assoc[col], bins=3, labels=[f"{col}_Low", f"{col}_Med", f"{col}_High"])
+
+df_encoded = pd.get_dummies(df_assoc[assoc_cols]).astype(bool)
+itemsets = apriori(df_encoded, min_support=0.01, use_colnames=True, max_len=3)
+rules = association_rules(itemsets, metric="lift", min_threshold=1.1)
+interesting = rules[
+    rules['antecedents'].astype(str).str.contains('leak_event_True|risk_high_True') |
+    rules['consequents'].astype(str).str.contains('leak_event_True|risk_high_True')
+]
+```
+
+---
+SECTION 5 — Visualization Techniques
+Goal: Communicate relationships, distributions, temporal behaviors, model results, and dimensionality reductions.
+
+Key plots produced:
+- Correlation heatmap for key sensors
+- Risk level distribution (pie)
+- Boxplot of sump flow vs risk level
+- Temporal radiation plot with leak highlights
+- Overlaid histograms of key features
+- PCA scatter (PC1 vs PC2) colored by risk
+- PCA explained variance bar chart and loadings plot
+- Regression actual vs predicted scatter
+- Model comparison bar charts (accuracy, R²)
+- Stacked area chart of risk levels over time
+
+Box plot summary rationale:
+- Shows the distribution (median, IQR) and outliers per group; ideal to compare sensor behavior across risk levels and quickly spot separation and anomaly patterns without assuming normality.
+
+Code snippet (examples):
+```python
+# Correlation heatmap
+df_corr = df[key_features[:12]].corr()
+sns.heatmap(df_corr, annot=True, cmap="RdBu_r", center=0, square=True)
+
+# Box plot: sump flow by risk level
+plt.figure(figsize=(6,4))
+sns.boxplot(data=df, x='risk_level', y='sump_flow_lpm')
+plt.xticks(rotation=45)
+plt.title('Sump Flow by Risk Level')
+plt.ylabel('LPM')
+
+# PCA scatter colored by risk
+for risk in df['risk_level'].unique():
+    mask = df['risk_level'] == risk
+    plt.scatter(df.loc[mask, 'pc_01'], df.loc[mask, 'pc_02'], s=2, alpha=0.6, label=risk)
+
+# Regression scatter
+plt.scatter(y_test_reg, y_pred_reg, alpha=0.6)
+plt.plot([y_test_reg.min(), y_test_reg.max()], [y_test_reg.min(), y_test_reg.max()], 'r--')
+```
+
+---
+SECTION 6 — Outputs & Artifacts
+Directories and key files:
+- data/raw: nuclear_sensors_raw.csv, nuclear_events_table.csv
+- data/processed: processed dataset, flags, reports, transformers, PCA assets, overview plots
+- data/mining_results: EDA, feature importance, confusion matrix, regression scatter, model summaries
+
+---
+SECTION 7 — Results Highlights (from this run)
+- Dataset: 20,160 rows × 93 columns; 1-minute cadence over 14 days
+- Risk levels: Normal 18,698; High Risk 1,462 (true leak timestamps)
+- Classification: 100% accuracy across evaluated models on this synthetic dataset
+- Binary leak detection: AUC = 1.00 across models
+- Regression (leak rate): Best R² = 0.997 (Random Forest)
+- PCA: 14 components capture 95% variance
+
+---
+SECTION 8 — How to Run
+```bash
+# 1) Generate synthetic data
+python generate_dataset.py
+
+# 2) Preprocess and transform
+python preprocess_transform.py
+
+# 3) Run mining pipeline
+python data_mining_pipeline.py
+```
+
+Notes for presentation:
+- Emphasize policy choices that preserve true events (no over-cleaning).
+- Highlight interpretability (indices, correlation with leak flag, feature importance).
+- Clarify synthetic nature and potential for overperformance; real-world generalization requires domain validation and additional regularization.
+
+---
+SECTION 9 — Rationale for Technique and Algorithm Choices
+Purpose: Anticipate stakeholder questions about “why this approach?” and articulate trade-offs.
+
+Data Generation:
+- Chose minute-level cadence and diurnal baselines to mirror operational physics and control cycles; supports temporal feature learning.
+- Injected gradual and rapid leaks to test sensitivity to different failure modes; impacts multiple correlated sensors for realism.
+- Added false positives (rad/humidity) to evaluate robustness against confounders.
+- Introduced MCAR missingness, contiguous outages, and drift to reflect real data quality issues observed in industrial telemetry.
+
+Preprocessing & Data Quality:
+- Gap policy (short ffill/bfill; medium interpolation; long flag-only) balances continuity with integrity—avoids fabricating long stretches that could bias models.
+- IQR + rolling-MAD outlier detection captures both global and local anomalies; event-aware capping preserves true leak signatures.
+- Savitzky–Golay and rolling median chosen for denoising due to edge behavior and trend preservation compared to aggressive filters.
+- Simple drift correction via median shift is transparent, low-variance, and adequate for synthetic drift; complex methods (e.g., CUSUM, BOCPD) are future options.
+
+Feature Engineering & Transformations:
+- Rolling stats and slopes encode short-term dynamics relevant to leak onset without requiring sequence models.
+- Composite indices improve interpretability for non-ML stakeholders by aggregating physics-consistent signals.
+- Yeo–Johnson handles zeros/negatives and reduces skew, improving linear model assumptions and SVM/RF stability.
+- PCA retains 95% variance to decorrelate features and reduce noise while keeping interpretable raw indices alongside components.
+
+Modeling — Classification:
+- Included a spectrum from linear (Logistic Regression) to non-linear (Tree/Forest/SVM/KNN) to benchmark bias–variance trade-offs.
+- Decision Tree and Random Forest favored for interpretability (rules/feature importance), non-parametric flexibility, and handling of mixed scales.
+- SVM with probability=True provides strong margins; useful when classes are separable after engineering.
+- KNN acts as a simple non-parametric baseline sensitive to local structure.
+- Stratified splits and cross-validation control variance on class imbalance (leak vs normal).
+
+Modeling — Regression (Leak Rate):
+- Random Forest selected as primary due to non-linear response and interaction handling; robust to outliers after policy.
+- Linear/Ridge retained as baselines for interpretability and to detect overfitting signals.
+- SVR tested for smooth function approximation; useful when kernel captures structure.
+- KNN regression offers a locality-based comparator.
+
+Association Rules:
+- Binning and one-hot encoding enable market-basket style patterns; rules focused on leak/high-risk to surface actionable co-occurrences.
+- Lift/confidence thresholds chosen to avoid spurious patterns on sparse events.
+
+Visualization:
+- Heatmaps, pies, boxplots, temporal overlays, PCA scatter/loadings selected to communicate to both technical and executive audiences.
+- Model comparison charts and confusion matrices provide quick performance narratives; regression identity plots show calibration.
+
+Limitations & Future Work:
+- Synthetic data can overstate performance; next steps include domain calibration, drift-aware retraining, cost-sensitive learning, and temporal models (e.g., HMM/LSTM).
+- Expand uncertainty quantification and establish alert thresholds tied to operational risk.
+
+END OF SUMMARY

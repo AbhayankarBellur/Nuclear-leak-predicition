@@ -1,0 +1,11 @@
+Algorithm,Task,Accuracy,CV_Mean,CV_Std,AUC
+Decision Tree,Multi-class,1.0,1.0,0.0,
+Random Forest,Multi-class,1.0,1.0,0.0,
+Logistic Regression,Multi-class,1.0,1.0,0.0,
+SVM,Multi-class,1.0,1.0,0.0,
+KNN,Multi-class,1.0,1.0,0.0,
+Decision Tree,Binary,1.0,,,1.0
+Random Forest,Binary,1.0,,,1.0
+Logistic Regression,Binary,1.0,,,1.0
+SVM,Binary,1.0,,,1.0
+KNN,Binary,1.0,,,1.0

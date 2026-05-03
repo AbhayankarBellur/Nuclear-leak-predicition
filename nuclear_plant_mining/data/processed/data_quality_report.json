@@ -1,0 +1,16 @@
+{
+  "timestamp_range": "2025-08-01 00:00:00 to 2025-08-14 23:59:00",
+  "total_missing_values": 21994,
+  "sensors_with_missing_data": 10,
+  "outliers_detected_total": 5447,
+  "leak_events_preserved": 1462,
+  "feature_categories": {
+    "raw_sensors": 26,
+    "denoised_versions": 8,
+    "rolling_features": 24,
+    "slope_features": 7,
+    "composite_indices": 3,
+    "pca_components": 14,
+    "transformed_features": 8
+  }
+}

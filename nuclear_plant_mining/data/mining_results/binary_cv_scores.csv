@@ -1,0 +1,6 @@
+Algorithm,ROC_AUC_CV_Mean,ROC_AUC_CV_Std,AP_CV_Mean,AP_CV_Std
+Decision Tree,1.0,0.0,1.0,0.0
+Random Forest,1.0,4.965068306494546e-17,1.0,0.0
+Logistic Regression,1.0,0.0,1.0,7.021666937153402e-17
+SVM,1.0,0.0,1.0,7.021666937153402e-17
+KNN,1.0,0.0,1.0,0.0

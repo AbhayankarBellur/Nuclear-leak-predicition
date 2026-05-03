@@ -1,0 +1,15 @@
+{
+  "total_rows": 20160,
+  "total_columns": 93,
+  "original_sensors": 23,
+  "engineered_features": 66,
+  "pca_components": 14,
+  "missing_data_handled": true,
+  "outliers_flagged": 6,
+  "drift_corrected": false,
+  "transformations_applied": [
+    "power_transform",
+    "standardization",
+    "pca"
+  ]
+}
